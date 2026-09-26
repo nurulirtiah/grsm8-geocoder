@@ -110,12 +110,14 @@ def clean_area_label(value):
     return value.strip(" ,-")
 
 
-def clean_coord(value):
+def clean_coord(value, low=-90, high=90):
+    """Validate a coordinate. Pass low/high=-180/180 for longitude —
+    the default -90..90 is only correct for latitude."""
     try:
         if value is None or str(value).strip() == "":
             return None
         number = float(value)
-        if not (-90 <= number <= 90):
+        if not (low <= number <= high):
             return None
         return round(number, 7)
     except (ValueError, TypeError):
@@ -392,8 +394,8 @@ def prepare_workbook(file_bytes):
         ws = workbook[sheet_name]
         cols = ensure_output_columns(ws)
         for row_num in range(2, ws.max_row + 1):
-            lat = clean_coord(ws.cell(row_num, cols["LAT"]).value) if "LAT" in cols else None
-            lon = clean_coord(ws.cell(row_num, cols["LONG"]).value) if "LONG" in cols else None
+            lat = clean_coord(ws.cell(row_num, cols["LAT"]).value, -90, 90) if "LAT" in cols else None
+            lon = clean_coord(ws.cell(row_num, cols["LONG"]).value, -180, 180) if "LONG" in cols else None
             if lat is None or lon is None:
                 skipped_no_coord += 1
                 continue
