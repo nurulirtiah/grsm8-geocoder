@@ -624,15 +624,48 @@ else:
 if uploaded:
     st.success(f"File siap diproses: **{uploaded.name}** ({uploaded.size / 1024:.1f} KB)")
 
-    file_hash = hashlib.sha256(uploaded.getvalue()).hexdigest()
+    # Read the uploaded file bytes explicitly. UploadedFile can be a file-like
+    # object whose current pointer has changed after a rerun, so do not rely on
+    # read() without rewinding. getvalue() is preferred, with read() as fallback.
+    file_bytes = uploaded.getvalue()
+    if not file_bytes:
+        uploaded.seek(0)
+        file_bytes = uploaded.read()
+
+    file_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "EMPTY"
     session_key = f"grsm8_v8_{file_hash}_{provider}"
 
+    if not file_bytes:
+        st.error("File Excel terbaca kosong. Silakan upload ulang file yang sama.")
+        st.stop()
+
     if st.session_state.get("active_session") != session_key:
-        prepared = prepare_workbook(uploaded.getvalue())
+        try:
+            prepared = prepare_workbook(file_bytes)
+        except Exception as exc:
+            st.error(f"Gagal membaca struktur Excel: {type(exc).__name__}: {exc}")
+            st.stop()
+
+        # Hard validation: if the workbook contains coordinate columns but the
+        # parser finds zero coordinates, show the actual sheets/headers instead
+        # of silently displaying 0/0. This makes initialization failures visible.
+        if not prepared.get("sheet_names"):
+            st.error("Tidak ada sheet yang bisa diproses di file Excel ini.")
+            st.stop()
+
         st.session_state.active_session = session_key
         st.session_state.prepared = prepared
         st.session_state.results = {}
         st.session_state.errors = 0
+
+    prepared = st.session_state.prepared
+    # Defensive re-check for old Streamlit session state created by an earlier
+    # version. If the stored preparation is empty while the file is not, rebuild it.
+    if (len(prepared.get("coordinates", [])) == 0 and file_bytes and
+            any(name in prepared.get("sheet_names", []) for name in ("Exclusive M1", "Exclusive M3"))):
+        rebuilt = prepare_workbook(file_bytes)
+        st.session_state.prepared = rebuilt
+        prepared = rebuilt
 
     prepared = st.session_state.prepared
     results = st.session_state.results
