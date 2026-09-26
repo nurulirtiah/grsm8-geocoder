@@ -8,12 +8,12 @@ import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi (v6)",
+    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi (v7)",
     page_icon="📍",
     layout="wide",
 )
 
-st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi (v6)")
+st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi (v7)")
 st.caption("Upload Excel → proses Lat/Long → isi Area, ALAMAT, Kategori Lokasi & Nama Lokasi → download Excel.")
 
 
@@ -139,6 +139,7 @@ def extract_poi_from_photon(props):
 
     return category, name
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 30)
 def geocode_photon(lat, lon):
     """Primary reverse geocoder using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
@@ -369,23 +370,18 @@ def get_columns(ws):
     return {header: idx + 1 for idx, header in enumerate(headers)}
 
 
-def process_workbook(uploaded_file, provider, google_key=None, use_fallback=False):
-    workbook = load_workbook(
-        io.BytesIO(uploaded_file.getvalue()),
-        data_only=False,
-    )
+def prepare_workbook(uploaded_file):
+    """Read workbook and collect rows/unique coordinates without geocoding."""
+    file_bytes = uploaded_file.getvalue()
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=False)
 
-    # Process these sheets when present. If one is absent, simply skip it.
     sheet_names = [
         name for name in ["Exclusive M1", "Exclusive M3"]
         if name in workbook.sheetnames
     ]
-
     if not sheet_names:
-        # Fallback: process every sheet if the workbook has different names.
         sheet_names = workbook.sheetnames
 
-    # First pass: collect rows and unique coordinates.
     jobs = []
     coordinate_set = set()
     skipped_no_coord = 0
@@ -394,32 +390,25 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
     for sheet_name in sheet_names:
         ws = workbook[sheet_name]
         cols = get_columns(ws)
-
-        missing = [
-            c for c in ["AREA", "LAT", "LONG", "ALAMAT", "KATEGORI LOKASI", "NAMA LOKASI"]
-            if c not in cols
-        ]
+        required = ["AREA", "LAT", "LONG", "ALAMAT", "KATEGORI LOKASI", "NAMA LOKASI"]
+        missing = [c for c in required if c not in cols]
         if missing:
             continue
 
         for row_num in range(2, ws.max_row + 1):
             lat = clean_coord(ws.cell(row_num, cols["LAT"]).value)
             lon = clean_coord(ws.cell(row_num, cols["LONG"]).value)
-
             if lat is None or lon is None:
                 skipped_no_coord += 1
                 continue
 
-            old_area = ws.cell(row_num, cols["AREA"]).value
-            old_address = ws.cell(row_num, cols["ALAMAT"]).value
-            old_category = ws.cell(row_num, cols["KATEGORI LOKASI"]).value
-            old_name = ws.cell(row_num, cols["NAMA LOKASI"]).value
-
-            # Only skip a row when all four output fields already have data.
-            if all(
-                value not in (None, "")
-                for value in [old_area, old_address, old_category, old_name]
-            ):
+            values = [
+                ws.cell(row_num, cols["AREA"]).value,
+                ws.cell(row_num, cols["ALAMAT"]).value,
+                ws.cell(row_num, cols["KATEGORI LOKASI"]).value,
+                ws.cell(row_num, cols["NAMA LOKASI"]).value,
+            ]
+            if all(value not in (None, "") for value in values):
                 already_complete += 1
                 continue
 
@@ -427,38 +416,50 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
             coordinate_set.add(key)
             jobs.append((sheet_name, row_num, key))
 
-    total_rows = len(jobs)
-    unique_coordinates = len(coordinate_set)
+    return {
+        "file_bytes": file_bytes,
+        "sheet_names": sheet_names,
+        "jobs": jobs,
+        "coordinates": list(coordinate_set),
+        "skipped_no_coord": skipped_no_coord,
+        "already_complete": already_complete,
+    }
 
-    if total_rows == 0:
-        return (
-            None,
-            {
-                "total_rows": 0,
-                "unique_coordinates": 0,
-                "processed": 0,
-                "errors": 0,
-                "skipped_no_coord": skipped_no_coord,
-                "already_complete": already_complete,
-                "fallback_used": 0,
-                "message": (
-                    "Tidak ada baris yang perlu diproses. "
-                    "Pastikan kolom Lat dan Long terisi."
-                ),
-            },
-        )
 
-    # Reverse geocode unique coordinates once.
-    coordinates = list(coordinate_set)
+def write_results_to_workbook(prepared, results):
+    """Create an Excel output using all results collected so far."""
+    workbook = load_workbook(io.BytesIO(prepared["file_bytes"]), data_only=False)
+
+    for sheet_name, row_num, coord in prepared["jobs"]:
+        result = results.get(coord, {})
+        if not result:
+            continue
+
+        ws = workbook[sheet_name]
+        cols = get_columns(ws)
+
+        if result.get("area"):
+            ws.cell(row_num, cols["AREA"]).value = result["area"]
+        if result.get("alamat"):
+            ws.cell(row_num, cols["ALAMAT"]).value = result["alamat"]
+        if result.get("kategori_lokasi"):
+            ws.cell(row_num, cols["KATEGORI LOKASI"]).value = result["kategori_lokasi"]
+        if result.get("nama_lokasi"):
+            ws.cell(row_num, cols["NAMA LOKASI"]).value = result["nama_lokasi"]
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def process_coordinate_batch(coordinates, provider, google_key=None):
+    """Process a small batch so Streamlit does not hold thousands of requests at once."""
     results = {}
     errors = 0
 
-    progress = st.progress(0, text="Menyiapkan koordinat...")
-    status = st.empty()
-
-    # Four workers keeps the process substantially faster than one request
-    # at a time while avoiding an aggressive request flood.
-    max_workers = 4
+    # Two workers is intentionally conservative for the public Photon service.
+    max_workers = 2
 
     def lookup(coord):
         lat, lon = coord
@@ -466,119 +467,37 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
             return coord, geocode_google(lat, lon, google_key)
         return coord, geocode_photon(lat, lon)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(lookup, coord): coord
-            for coord in coordinates
-        }
+    progress = st.progress(0, text=f"Memproses 0 / {len(coordinates):,} batch ini...")
+    status = st.empty()
 
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(lookup, coord): coord for coord in coordinates}
         for index, future in enumerate(as_completed(future_map), start=1):
             coord = future_map[future]
-
             try:
                 _, result = future.result()
             except Exception as exc:
                 result = {
                     "area": "",
                     "alamat": "",
+                    "kategori_lokasi": "",
+                    "nama_lokasi": "",
                     "status": f"ERROR: {type(exc).__name__}",
                 }
 
             results[coord] = result
-
             if str(result.get("status", "")).startswith("ERROR"):
                 errors += 1
 
-            pct = index / max(unique_coordinates, 1)
             progress.progress(
-                pct,
-                text=f"Reverse geocoding {index:,} / {unique_coordinates:,}"
+                index / max(len(coordinates), 1),
+                text=f"Batch: {index:,} / {len(coordinates):,}",
             )
-            status.write(
-                f"Koordinat selesai: **{index:,} / {unique_coordinates:,}**"
-            )
+            status.write(f"Koordinat selesai: **{index:,} / {len(coordinates):,}**")
 
-    # Fallback only for incomplete Photon results. Nominatim's public service
-    # requires single-threaded use and at most 1 request/second.
-    fallback_count = 0
-    if provider == "OpenStreetMap / Photon" and use_fallback:
-        # Nominatim fallback is used only when the address/area itself is
-        # incomplete. We do NOT trigger one Nominatim request merely because
-        # a POI name is absent, otherwise a large workbook could cause
-        # hundreds/thousands of slow public-service requests.
-        incomplete = [
-            coord for coord, result in results.items()
-            if not result.get("area") or not result.get("alamat")
-        ]
-        if incomplete:
-            fallback_progress = st.progress(0, text="Melengkapi hasil yang belum lengkap...")
-            fallback_status = st.empty()
-            for idx, coord in enumerate(incomplete, start=1):
-                try:
-                    time.sleep(1.05)
-                    fallback = geocode_nominatim_fallback(*coord)
-                    current = results.get(coord, {})
-                    if fallback.get("area"):
-                        current["area"] = fallback["area"]
-                    if fallback.get("alamat"):
-                        current["alamat"] = fallback["alamat"]
-                    if fallback.get("kategori_lokasi"):
-                        current["kategori_lokasi"] = fallback["kategori_lokasi"]
-                    if fallback.get("nama_lokasi"):
-                        current["nama_lokasi"] = fallback["nama_lokasi"]
-                    current["status"] = fallback.get("status", current.get("status", ""))
-                    results[coord] = current
-                    fallback_count += 1
-                except Exception:
-                    pass
-                fallback_progress.progress(idx / len(incomplete), text=f"Melengkapi {idx:,} / {len(incomplete):,}")
-                fallback_status.write(f"Fallback selesai: **{idx:,} / {len(incomplete):,}**")
-            fallback_status.empty()
-
-    # Second pass: write results into workbook.
-    rows_written = 0
-
-    for sheet_name, row_num, coord in jobs:
-        ws = workbook[sheet_name]
-        cols = get_columns(ws)
-
-        result = results.get(coord, {})
-        area = result.get("area", "")
-        address = result.get("alamat", "")
-        category = result.get("kategori_lokasi", "")
-        location_name = result.get("nama_lokasi", "")
-
-        if area:
-            ws.cell(row_num, cols["AREA"]).value = area
-
-        if address:
-            ws.cell(row_num, cols["ALAMAT"]).value = address
-
-        if category:
-            ws.cell(row_num, cols["KATEGORI LOKASI"]).value = category
-
-        if location_name:
-            ws.cell(row_num, cols["NAMA LOKASI"]).value = location_name
-
-        rows_written += 1
-
-    output = io.BytesIO()
-    workbook.save(output)
-    output.seek(0)
-
-    progress.progress(1.0, text="Selesai.")
     status.empty()
+    return results, errors
 
-    return output.getvalue(), {
-        "total_rows": total_rows,
-        "unique_coordinates": unique_coordinates,
-        "processed": rows_written,
-        "errors": errors,
-        "skipped_no_coord": skipped_no_coord,
-        "already_complete": already_complete,
-        "fallback_used": fallback_count,
-        "message": "",
-    }
 
 
 # ------------------------------------------------------------------
@@ -598,85 +517,119 @@ provider = st.radio(
 )
 
 google_key = None
-
 use_fallback = False
 if provider == "OpenStreetMap / Photon":
     use_fallback = st.checkbox(
         "Lengkapi hasil yang masih kosong dengan Nominatim (lebih lambat, 1 koordinat/detik)",
-        value=True,
-        help="Fallback hanya dipakai untuk koordinat yang hasil Photon-nya belum lengkap. Hasil dicache agar koordinat yang sama tidak diminta ulang."
+        value=False,
+        help="Sengaja dimatikan dulu. Nominatim publik dibatasi 1 request/detik.",
     )
 
 if provider == "Google Maps":
-    google_key = st.text_input(
-        "Google Maps Geocoding API Key",
-        type="password",
-    )
+    google_key = st.text_input("Google Maps Geocoding API Key", type="password")
 
 if uploaded:
     st.success(
-        f"File siap diproses: **{uploaded.name}** "
-        f"({uploaded.size / 1024:.1f} KB)"
+        f"File siap diproses: **{uploaded.name}** ({uploaded.size / 1024:.1f} KB)"
     )
 
-    if st.button(
-        "🚀 Proses Koordinat",
-        type="primary",
-        disabled=(provider == "Google Maps" and not google_key),
-    ):
-        try:
-            with st.spinner("Membaca Excel..."):
-                output, stats = process_workbook(
-                    uploaded,
-                    provider,
-                    google_key,
-                    use_fallback,
-                )
+    import hashlib
+    file_hash = hashlib.sha256(uploaded.getvalue()).hexdigest()
+    session_key = f"grsm8_{file_hash}_{provider}"
 
-            if output is None:
-                st.warning(stats["message"])
-            else:
-                st.success("🎉 Proses selesai!")
+    if st.session_state.get("active_session") != session_key:
+        prepared = prepare_workbook(uploaded)
+        st.session_state.active_session = session_key
+        st.session_state.prepared = prepared
+        st.session_state.results = {}
+        st.session_state.errors = 0
 
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric(
-                    "Baris diproses",
-                    f"{stats['processed']:,}",
-                )
-                col2.metric(
-                    "Koordinat unik",
-                    f"{stats['unique_coordinates']:,}",
-                )
-                col3.metric(
-                    "Tanpa koordinat",
-                    f"{stats['skipped_no_coord']:,}",
-                )
-                col4.metric(
-                    "Error",
-                    f"{stats['errors']:,}",
-                )
-                col5.metric(
-                    "Fallback",
-                    f"{stats.get('fallback_used', 0):,}",
-                )
+    prepared = st.session_state.prepared
+    results = st.session_state.results
+    all_coordinates = prepared["coordinates"]
+    pending = [coord for coord in all_coordinates if coord not in results]
+    total_unique = len(all_coordinates)
+    completed = len(results)
 
-                st.download_button(
-                    "📥 Download Excel hasil",
-                    data=output,
-                    file_name="EXCLUSIVE TOKO M1 M3_GRSM8_terisi.xlsx",
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet"
-                    ),
-                    type="primary",
-                )
+    st.info(
+        f"**Progres saat ini: {completed:,} / {total_unique:,} koordinat.** "
+        "Aplikasi diproses bertahap supaya kalau berhenti, progres sebelumnya tidak hilang."
+    )
 
-        except Exception as exc:
-            st.error("Aplikasi mengalami error saat memproses file.")
-            st.exception(exc)
+    if total_unique:
+        st.progress(
+            completed / total_unique,
+            text=f"Total: {completed:,} / {total_unique:,} koordinat selesai",
+        )
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Koordinat unik", f"{total_unique:,}")
+    col2.metric("Sudah selesai", f"{completed:,}")
+    col3.metric("Sisa", f"{len(pending):,}")
+
+    if pending:
+        batch_size = 100
+        label = (
+            f"🚀 Proses {min(batch_size, len(pending)):,} koordinat berikutnya"
+            if completed
+            else f"🚀 Mulai proses {min(batch_size, len(pending)):,} koordinat"
+        )
+
+        if st.button(
+            label,
+            type="primary",
+            disabled=(provider == "Google Maps" and not google_key),
+        ):
+            batch = pending[:batch_size]
+            batch_results, batch_errors = process_coordinate_batch(
+                batch,
+                provider,
+                google_key,
+            )
+            st.session_state.results.update(batch_results)
+            st.session_state.errors += batch_errors
+            st.rerun()
+
+    else:
+        st.success("🎉 Semua koordinat unik sudah selesai diproses!")
+
+    # Optional Nominatim fallback is intentionally offered only after Photon/Google
+    # batches have completed. This avoids unexpectedly generating hundreds of
+    # public Nominatim requests during the main run.
+    if not pending and use_fallback and provider == "OpenStreetMap / Photon":
+        incomplete = [
+            coord for coord, result in results.items()
+            if not result.get("area") or not result.get("alamat")
+        ]
+        if incomplete:
+            st.warning(
+                f"Masih ada {len(incomplete):,} koordinat dengan Area/Alamat belum lengkap. "
+                "Fallback Nominatim belum dijalankan otomatis."
+            )
+
+    if results:
+        output = write_results_to_workbook(prepared, results)
+        done = len(results) >= total_unique
+        st.download_button(
+            "📥 Download hasil sementara" if not done else "📥 Download Excel hasil FINAL",
+            data=output,
+            file_name=(
+                "EXCLUSIVE TOKO M1 M3_GRSM8_progress.xlsx"
+                if not done
+                else "EXCLUSIVE TOKO M1 M3_GRSM8_terisi.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+        if not done:
+            st.caption(
+                "💡 Kamu boleh download hasil sementara kapan saja. "
+                "Setelah itu klik tombol proses lagi untuk melanjutkan batch berikutnya."
+            )
 
 st.markdown("---")
 st.caption(
     "OpenStreetMap / Photon digunakan sebagai default tanpa API key. "
-    "Hasil reverse geocoding dapat berbeda dari label Google Maps."
+    "Versi ini memproses 100 koordinat per batch dan menyimpan progres di sesi browser."
 )
