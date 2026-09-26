@@ -7,18 +7,143 @@ import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Area & Alamat",
+    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi",
     page_icon="📍",
     layout="wide",
 )
 
-st.title("📍 GRSM 8 — Koordinat → Area & Alamat")
-st.caption("Upload Excel → proses Lat/Long → isi Area & ALAMAT → download Excel.")
+st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi")
+st.caption("Upload Excel → proses Lat/Long → isi Area, ALAMAT, Kategori Lokasi & Nama Lokasi → download Excel.")
+
+
+# ------------------------------------------------------------------
+# POI / lokasi identification
+# ------------------------------------------------------------------
+
+def normalize_location_category(osm_key, osm_value, feature_type=""):
+    """Convert OSM/Photon tags into a simple Indonesian category."""
+    key = str(osm_key or "").lower().strip()
+    value = str(osm_value or "").lower().strip()
+    ftype = str(feature_type or "").lower().strip()
+
+    mapping = {
+        ("amenity", "school"): "Sekolah",
+        ("amenity", "college"): "Perguruan Tinggi",
+        ("amenity", "university"): "Perguruan Tinggi",
+        ("amenity", "kindergarten"): "Sekolah",
+        ("amenity", "hospital"): "Rumah Sakit",
+        ("amenity", "clinic"): "Klinik",
+        ("amenity", "pharmacy"): "Apotek",
+        ("amenity", "place_of_worship"): "Tempat Ibadah",
+        ("amenity", "restaurant"): "Restoran",
+        ("amenity", "cafe"): "Kafe",
+        ("amenity", "fast_food"): "Restoran",
+        ("amenity", "fuel"): "SPBU",
+        ("amenity", "bank"): "Bank",
+        ("amenity", "post_office"): "Kantor Pos",
+        ("amenity", "police"): "Kepolisian",
+        ("amenity", "fire_station"): "Pemadam Kebakaran",
+        ("amenity", "townhall"): "Kantor Pemerintah",
+        ("amenity", "community_centre"): "Fasilitas Komunitas",
+        ("shop", "supermarket"): "Supermarket",
+        ("shop", "convenience"): "Toko",
+        ("shop", "department_store"): "Toko",
+        ("shop", "mall"): "Pusat Perbelanjaan",
+        ("shop", "bakery"): "Toko Roti",
+        ("shop", "clothes"): "Toko Pakaian",
+        ("shop", "hardware"): "Toko Bangunan",
+        ("shop", "car"): "Dealer Mobil",
+        ("shop", "motorcycle"): "Dealer Motor",
+        ("shop", "mobile_phone"): "Toko HP",
+        ("tourism", "hotel"): "Hotel",
+        ("tourism", "guest_house"): "Penginapan",
+        ("tourism", "motel"): "Penginapan",
+        ("tourism", "attraction"): "Tempat Wisata",
+        ("leisure", "sports_centre"): "Pusat Olahraga",
+        ("leisure", "stadium"): "Stadion",
+        ("office", "government"): "Kantor Pemerintah",
+        ("office", "company"): "Kantor",
+        ("office", "ngo"): "Organisasi",
+        ("public_transport", "station"): "Stasiun",
+        ("railway", "station"): "Stasiun",
+        ("highway", "bus_stop"): "Halte",
+    }
+
+    if (key, value) in mapping:
+        return mapping[(key, value)]
+
+    # Common OSM values that are useful even when the exact combination
+    # is not in the mapping above.
+    if key == "shop":
+        return "Toko"
+    if key == "school" or value in {"school", "kindergarten", "college", "university"}:
+        return "Sekolah"
+    if value in {"church", "chapel"}:
+        return "Gereja"
+    if value in {"mosque", "musalla"}:
+        return "Masjid"
+    if value in {"temple", "shrine"}:
+        return "Tempat Ibadah"
+    if key == "place" and value in {"city", "town", "village", "hamlet"}:
+        return "Permukiman"
+    if ftype in {"house", "residential"}:
+        return "Permukiman"
+
+    return ""
+
+
+def is_poi_feature(props):
+    """True when Photon feature looks like a named POI rather than a road."""
+    key = str(props.get("osm_key") or "").lower().strip()
+    value = str(props.get("osm_value") or "").lower().strip()
+    name = str(props.get("name") or "").strip()
+
+    if not name:
+        return False
+
+    # A highway/street name by itself is not a location/POI.
+    if key == "highway" and value not in {"bus_stop", "services", "rest_area"}:
+        return False
+
+    poi_keys = {
+        "amenity", "shop", "tourism", "leisure", "office",
+        "public_transport", "railway", "healthcare", "education",
+        "craft", "building", "historic", "sport"
+    }
+    return key in poi_keys
+
+
+def extract_poi_from_photon(props):
+    """Return POI category + name from a Photon feature when available."""
+    if not is_poi_feature(props):
+        return "", ""
+
+    category = normalize_location_category(
+        props.get("osm_key"),
+        props.get("osm_value"),
+        props.get("type"),
+    )
+    name = str(props.get("name") or "").strip()
+
+    # Don't call a generic OSM object name a POI if it has no usable category.
+    if not category and name:
+        key = str(props.get("osm_key") or "").lower().strip()
+        if key in {"building", "historic", "sport", "craft", "healthcare", "education"}:
+            category = "Fasilitas/Lokasi"
+
+    return category, name
 
 st.info(
     "File yang kamu upload sudah kamu filter hanya untuk GRSM 8, "
     "jadi aplikasi ini akan memproses SEMUA baris yang memiliki koordinat "
     "di sheet Exclusive M1 dan Exclusive M3. Baris tanpa Lat/Long akan dilewati."
+)
+
+st.info(
+    "Kolom KATEGORI LOKASI dan NAMA LOKASI akan diisi jika koordinat "
+    "teridentifikasi sebagai POI/tempat bernama di data OpenStreetMap. "
+    "Jika tidak ada POI yang terdaftar, kolom tersebut dibiarkan kosong "
+    "dan ALAMAT tetap diisi semaksimal mungkin."
 )
 
 # ------------------------------------------------------------------
@@ -29,7 +154,7 @@ st.info(
 def geocode_photon(lat, lon):
     """Primary reverse geocoder using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
-    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/3.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
+    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/4.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
 
     for attempt in range(4):
         try:
@@ -46,9 +171,17 @@ def geocode_photon(lat, lon):
             data = response.json()
             features = data.get("features", [])
             if not features:
-                return {"area": "", "alamat": "", "kecamatan": "", "status": "TIDAK DITEMUKAN"}
+                return {
+                    "area": "",
+                    "alamat": "",
+                    "kecamatan": "",
+                    "kategori_lokasi": "",
+                    "nama_lokasi": "",
+                    "status": "TIDAK DITEMUKAN",
+                }
 
             props = features[0].get("properties", {})
+            kategori_lokasi, nama_lokasi = extract_poi_from_photon(props)
             road = props.get("street") or props.get("name") or ""
             house = props.get("housenumber") or ""
             kec = props.get("district") or props.get("city_district") or props.get("locality") or ""
@@ -67,13 +200,22 @@ def geocode_photon(lat, lon):
                 "area": str(area),
                 "alamat": alamat,
                 "kecamatan": str(kec),
+                "kategori_lokasi": kategori_lokasi,
+                "nama_lokasi": nama_lokasi,
                 "status": "OK" if (area or alamat) else "TIDAK LENGKAP",
             }
         except Exception as exc:
             if attempt < 3:
                 time.sleep(1.5 * (attempt + 1))
             else:
-                return {"area": "", "alamat": "", "kecamatan": "", "status": f"ERROR: {type(exc).__name__}"}
+                return {
+                    "area": "",
+                    "alamat": "",
+                    "kecamatan": "",
+                    "kategori_lokasi": "",
+                    "nama_lokasi": "",
+                    "status": f"ERROR: {type(exc).__name__}",
+                }
 
     return {"area": "", "alamat": "", "kecamatan": "", "status": "ERROR: rate limit"}
 
@@ -83,7 +225,7 @@ def geocode_nominatim_fallback(lat, lon):
     """Fallback only for incomplete Photon results. One request at a time."""
     url = "https://nominatim.openstreetmap.org/reverse"
     headers = {
-        "User-Agent": "GRSM8-Coordinate-Geocoder/3.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
+        "User-Agent": "GRSM8-Coordinate-Geocoder/4.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
         "Accept-Language": "id,en",
     }
     response = requests.get(
@@ -93,6 +235,7 @@ def geocode_nominatim_fallback(lat, lon):
             "lon": float(lon),
             "format": "jsonv2",
             "addressdetails": 1,
+            "namedetails": 1,
             "zoom": 18,
         },
         headers=headers,
@@ -109,6 +252,21 @@ def geocode_nominatim_fallback(lat, lon):
     area = addr.get("county") or addr.get("city") or addr.get("town") or addr.get("municipality") or ""
     state = addr.get("state") or ""
 
+    category = normalize_location_category(
+        data.get("category") or data.get("class"),
+        data.get("type"),
+        data.get("type"),
+    )
+    name_details = data.get("namedetails") or {}
+    poi_name = (
+        name_details.get("name")
+        or data.get("name")
+        or ""
+    )
+    # Do not use a road name as the POI name.
+    if poi_name and str(poi_name).strip() == str(road).strip():
+        poi_name = ""
+
     first = f"{road} No. {house}" if road and house else road
     parts = []
     for value in [first, desa, kec, area, state]:
@@ -121,6 +279,8 @@ def geocode_nominatim_fallback(lat, lon):
         "area": str(area),
         "alamat": alamat,
         "kecamatan": str(kec),
+        "kategori_lokasi": category,
+        "nama_lokasi": str(poi_name).strip(),
         "status": "OK_FALLBACK" if (area or alamat) else "TIDAK DITEMUKAN",
     }
 
@@ -145,6 +305,8 @@ def geocode_google(lat, lon, api_key):
         return {
             "area": "",
             "alamat": "",
+            "kategori_lokasi": "",
+            "nama_lokasi": "",
             "status": data.get("status", "TIDAK DITEMUKAN"),
         }
 
@@ -165,9 +327,36 @@ def geocode_google(lat, lon, api_key):
                 area = component.get("long_name", "")
                 break
 
+    result_types = set(result.get("types", []))
+    google_category = ""
+    google_name = result.get("name", "") or ""
+
+    if "school" in result_types:
+        google_category = "Sekolah"
+    elif "church" in result_types:
+        google_category = "Gereja"
+    elif "mosque" in result_types:
+        google_category = "Masjid"
+    elif "hospital" in result_types:
+        google_category = "Rumah Sakit"
+    elif "pharmacy" in result_types:
+        google_category = "Apotek"
+    elif "restaurant" in result_types:
+        google_category = "Restoran"
+    elif "cafe" in result_types:
+        google_category = "Kafe"
+    elif "gas_station" in result_types:
+        google_category = "SPBU"
+    elif "bank" in result_types:
+        google_category = "Bank"
+    elif "store" in result_types or "shopping_mall" in result_types:
+        google_category = "Toko/Pusat Perbelanjaan"
+
     return {
         "area": area,
         "alamat": alamat,
+        "kategori_lokasi": google_category,
+        "nama_lokasi": google_name,
         "status": "OK",
     }
 
@@ -219,7 +408,7 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
         cols = get_columns(ws)
 
         missing = [
-            c for c in ["AREA", "LAT", "LONG", "ALAMAT"]
+            c for c in ["AREA", "LAT", "LONG", "ALAMAT", "KATEGORI LOKASI", "NAMA LOKASI"]
             if c not in cols
         ]
         if missing:
@@ -235,11 +424,13 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
 
             old_area = ws.cell(row_num, cols["AREA"]).value
             old_address = ws.cell(row_num, cols["ALAMAT"]).value
+            old_category = ws.cell(row_num, cols["KATEGORI LOKASI"]).value
+            old_name = ws.cell(row_num, cols["NAMA LOKASI"]).value
 
-            # If both fields are already filled, don't overwrite them.
-            if (
-                old_area not in (None, "")
-                and old_address not in (None, "")
+            # Only skip a row when all four output fields already have data.
+            if all(
+                value not in (None, "")
+                for value in [old_area, old_address, old_category, old_name]
             ):
                 already_complete += 1
                 continue
@@ -323,6 +514,10 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
     # requires single-threaded use and at most 1 request/second.
     fallback_count = 0
     if provider == "OpenStreetMap / Photon" and use_fallback:
+        # Nominatim fallback is used only when the address/area itself is
+        # incomplete. We do NOT trigger one Nominatim request merely because
+        # a POI name is absent, otherwise a large workbook could cause
+        # hundreds/thousands of slow public-service requests.
         incomplete = [
             coord for coord, result in results.items()
             if not result.get("area") or not result.get("alamat")
@@ -339,6 +534,10 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
                         current["area"] = fallback["area"]
                     if fallback.get("alamat"):
                         current["alamat"] = fallback["alamat"]
+                    if fallback.get("kategori_lokasi"):
+                        current["kategori_lokasi"] = fallback["kategori_lokasi"]
+                    if fallback.get("nama_lokasi"):
+                        current["nama_lokasi"] = fallback["nama_lokasi"]
                     current["status"] = fallback.get("status", current.get("status", ""))
                     results[coord] = current
                     fallback_count += 1
@@ -358,12 +557,20 @@ def process_workbook(uploaded_file, provider, google_key=None, use_fallback=Fals
         result = results.get(coord, {})
         area = result.get("area", "")
         address = result.get("alamat", "")
+        category = result.get("kategori_lokasi", "")
+        location_name = result.get("nama_lokasi", "")
 
         if area:
             ws.cell(row_num, cols["AREA"]).value = area
 
         if address:
             ws.cell(row_num, cols["ALAMAT"]).value = address
+
+        if category:
+            ws.cell(row_num, cols["KATEGORI LOKASI"]).value = category
+
+        if location_name:
+            ws.cell(row_num, cols["NAMA LOKASI"]).value = location_name
 
         rows_written += 1
 
