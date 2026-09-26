@@ -7,12 +7,12 @@ import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi (v5)",
+    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi",
     page_icon="📍",
     layout="wide",
 )
 
-st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi (v5)")
+st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi")
 st.caption("Upload Excel → proses Lat/Long → isi Area, ALAMAT, Kategori Lokasi & Nama Lokasi → download Excel.")
 
 
