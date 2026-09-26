@@ -27,11 +27,9 @@ st.info(
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def geocode_photon(lat, lon):
-    """Reverse geocode one coordinate using Photon/OpenStreetMap."""
+    """Primary reverse geocoder using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
-    headers = {
-        "User-Agent": "GRSM8-Coordinate-Geocoder/2.0"
-    }
+    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/3.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
 
     for attempt in range(4):
         try:
@@ -41,66 +39,89 @@ def geocode_photon(lat, lon):
                 headers=headers,
                 timeout=25,
             )
-
             if response.status_code == 429:
                 time.sleep(2 ** attempt)
                 continue
-
             response.raise_for_status()
             data = response.json()
-
             features = data.get("features", [])
             if not features:
-                return {
-                    "area": "",
-                    "alamat": "",
-                    "status": "TIDAK DITEMUKAN",
-                }
+                return {"area": "", "alamat": "", "kecamatan": "", "status": "TIDAK DITEMUKAN"}
 
             props = features[0].get("properties", {})
+            road = props.get("street") or props.get("name") or ""
+            house = props.get("housenumber") or ""
+            kec = props.get("district") or props.get("city_district") or props.get("locality") or ""
+            desa = props.get("village") or props.get("suburb") or props.get("neighbourhood") or ""
+            area = props.get("city") or props.get("county") or props.get("municipality") or props.get("town") or props.get("state_district") or ""
 
-            street = (
-                props.get("street")
-                or props.get("name")
-                or ""
-            )
-            housenumber = props.get("housenumber") or ""
-
-            if street and housenumber:
-                alamat = f"{street} No. {housenumber}"
-            else:
-                alamat = street
-
-            # Photon can return city/county/district depending on location.
-            # For this workbook we want kabupaten/kota.
-            area = (
-                props.get("city")
-                or props.get("county")
-                or props.get("district")
-                or props.get("state_district")
-                or ""
-            )
+            first = f"{road} No. {house}" if road and house else road
+            parts = []
+            for value in [first, desa, kec, area]:
+                value = str(value).strip() if value else ""
+                if value and value not in parts:
+                    parts.append(value)
+            alamat = ", ".join(parts)
 
             return {
                 "area": str(area),
-                "alamat": str(alamat),
+                "alamat": alamat,
+                "kecamatan": str(kec),
                 "status": "OK" if (area or alamat) else "TIDAK LENGKAP",
             }
-
         except Exception as exc:
             if attempt < 3:
                 time.sleep(1.5 * (attempt + 1))
             else:
-                return {
-                    "area": "",
-                    "alamat": "",
-                    "status": f"ERROR: {type(exc).__name__}",
-                }
+                return {"area": "", "alamat": "", "kecamatan": "", "status": f"ERROR: {type(exc).__name__}"}
 
+    return {"area": "", "alamat": "", "kecamatan": "", "status": "ERROR: rate limit"}
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 30)
+def geocode_nominatim_fallback(lat, lon):
+    """Fallback only for incomplete Photon results. One request at a time."""
+    url = "https://nominatim.openstreetmap.org/reverse"
+    headers = {
+        "User-Agent": "GRSM8-Coordinate-Geocoder/3.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
+        "Accept-Language": "id,en",
+    }
+    response = requests.get(
+        url,
+        params={
+            "lat": float(lat),
+            "lon": float(lon),
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "zoom": 18,
+        },
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    addr = data.get("address", {})
+
+    road = addr.get("road") or addr.get("pedestrian") or addr.get("footway") or addr.get("path") or ""
+    house = addr.get("house_number") or ""
+    desa = addr.get("village") or addr.get("suburb") or addr.get("neighbourhood") or addr.get("hamlet") or ""
+    kec = addr.get("district") or addr.get("city_district") or addr.get("municipality") or ""
+    area = addr.get("county") or addr.get("city") or addr.get("town") or addr.get("municipality") or ""
+    state = addr.get("state") or ""
+
+    first = f"{road} No. {house}" if road and house else road
+    parts = []
+    for value in [first, desa, kec, area, state]:
+        value = str(value).strip() if value else ""
+        if value and value not in parts:
+            parts.append(value)
+
+    alamat = ", ".join(parts)
     return {
-        "area": "",
-        "alamat": "",
-        "status": "ERROR: rate limit",
+        "area": str(area),
+        "alamat": alamat,
+        "kecamatan": str(kec),
+        "status": "OK_FALLBACK" if (area or alamat) else "TIDAK DITEMUKAN",
     }
 
 
@@ -171,7 +192,7 @@ def get_columns(ws):
     return {header: idx + 1 for idx, header in enumerate(headers)}
 
 
-def process_workbook(uploaded_file, provider, google_key=None):
+def process_workbook(uploaded_file, provider, google_key=None, use_fallback=False):
     workbook = load_workbook(
         io.BytesIO(uploaded_file.getvalue()),
         data_only=False,
@@ -240,6 +261,7 @@ def process_workbook(uploaded_file, provider, google_key=None):
                 "errors": 0,
                 "skipped_no_coord": skipped_no_coord,
                 "already_complete": already_complete,
+                "fallback_used": 0,
                 "message": (
                     "Tidak ada baris yang perlu diproses. "
                     "Pastikan kolom Lat dan Long terisi."
@@ -297,6 +319,35 @@ def process_workbook(uploaded_file, provider, google_key=None):
                 f"Koordinat selesai: **{index:,} / {unique_coordinates:,}**"
             )
 
+    # Fallback only for incomplete Photon results. Nominatim's public service
+    # requires single-threaded use and at most 1 request/second.
+    fallback_count = 0
+    if provider == "OpenStreetMap / Photon" and use_fallback:
+        incomplete = [
+            coord for coord, result in results.items()
+            if not result.get("area") or not result.get("alamat")
+        ]
+        if incomplete:
+            fallback_progress = st.progress(0, text="Melengkapi hasil yang belum lengkap...")
+            fallback_status = st.empty()
+            for idx, coord in enumerate(incomplete, start=1):
+                try:
+                    time.sleep(1.05)
+                    fallback = geocode_nominatim_fallback(*coord)
+                    current = results.get(coord, {})
+                    if fallback.get("area"):
+                        current["area"] = fallback["area"]
+                    if fallback.get("alamat"):
+                        current["alamat"] = fallback["alamat"]
+                    current["status"] = fallback.get("status", current.get("status", ""))
+                    results[coord] = current
+                    fallback_count += 1
+                except Exception:
+                    pass
+                fallback_progress.progress(idx / len(incomplete), text=f"Melengkapi {idx:,} / {len(incomplete):,}")
+                fallback_status.write(f"Fallback selesai: **{idx:,} / {len(incomplete):,}**")
+            fallback_status.empty()
+
     # Second pass: write results into workbook.
     rows_written = 0
 
@@ -330,6 +381,7 @@ def process_workbook(uploaded_file, provider, google_key=None):
         "errors": errors,
         "skipped_no_coord": skipped_no_coord,
         "already_complete": already_complete,
+        "fallback_used": fallback_count,
         "message": "",
     }
 
@@ -351,6 +403,14 @@ provider = st.radio(
 )
 
 google_key = None
+
+use_fallback = False
+if provider == "OpenStreetMap / Photon":
+    use_fallback = st.checkbox(
+        "Lengkapi hasil yang masih kosong dengan Nominatim (lebih lambat, 1 koordinat/detik)",
+        value=True,
+        help="Fallback hanya dipakai untuk koordinat yang hasil Photon-nya belum lengkap. Hasil dicache agar koordinat yang sama tidak diminta ulang."
+    )
 
 if provider == "Google Maps":
     google_key = st.text_input(
@@ -375,6 +435,7 @@ if uploaded:
                     uploaded,
                     provider,
                     google_key,
+                    use_fallback,
                 )
 
             if output is None:
@@ -382,7 +443,7 @@ if uploaded:
             else:
                 st.success("🎉 Proses selesai!")
 
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric(
                     "Baris diproses",
                     f"{stats['processed']:,}",
@@ -398,6 +459,10 @@ if uploaded:
                 col4.metric(
                     "Error",
                     f"{stats['errors']:,}",
+                )
+                col5.metric(
+                    "Fallback",
+                    f"{stats.get('fallback_used', 0):,}",
                 )
 
                 st.download_button(
