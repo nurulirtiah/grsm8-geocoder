@@ -7,12 +7,12 @@ import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi",
+    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi (v5)",
     page_icon="📍",
     layout="wide",
 )
 
-st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi")
+st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi (v5)")
 st.caption("Upload Excel → proses Lat/Long → isi Area, ALAMAT, Kategori Lokasi & Nama Lokasi → download Excel.")
 
 
@@ -93,28 +93,36 @@ def normalize_location_category(osm_key, osm_value, feature_type=""):
 
 
 def is_poi_feature(props):
-    """True when Photon feature looks like a named POI rather than a road."""
+    """Only accept explicitly named, place-like OSM features as POIs."""
     key = str(props.get("osm_key") or "").lower().strip()
-    value = str(props.get("osm_value") or "").lower().strip()
     name = str(props.get("name") or "").strip()
 
-    if not name:
-        return False
-
-    # A highway/street name by itself is not a location/POI.
-    if key == "highway" and value not in {"bus_stop", "services", "rest_area"}:
+    if not name or key in {"highway", "place"}:
         return False
 
     poi_keys = {
         "amenity", "shop", "tourism", "leisure", "office",
         "public_transport", "railway", "healthcare", "education",
-        "craft", "building", "historic", "sport"
+        "craft", "historic", "sport"
     }
     return key in poi_keys
 
 
+def looks_like_address_fragment(name):
+    low = str(name or "").strip().lower()
+    if not low:
+        return True
+    if re.fullmatch(r"(rt|rw)\s*[\d /-]+", low):
+        return True
+    prefixes = (
+        "rt ", "rw ", "rt.", "rw.", "rukun tetangga", "rukun warga",
+        "dusun ", "lingkungan ", "blok ", "jalan ", "jl. ", "jl ",
+        "no. ", "nomor "
+    )
+    return low.startswith(prefixes)
+
 def extract_poi_from_photon(props):
-    """Return POI category + name from a Photon feature when available."""
+    """Return POI category/name only when the map has an explicit POI tag."""
     if not is_poi_feature(props):
         return "", ""
 
@@ -125,36 +133,15 @@ def extract_poi_from_photon(props):
     )
     name = str(props.get("name") or "").strip()
 
-    # Don't call a generic OSM object name a POI if it has no usable category.
-    if not category and name:
-        key = str(props.get("osm_key") or "").lower().strip()
-        if key in {"building", "historic", "sport", "craft", "healthcare", "education"}:
-            category = "Fasilitas/Lokasi"
+    if looks_like_address_fragment(name) or not category:
+        return "", ""
 
     return category, name
 
-st.info(
-    "File yang kamu upload sudah kamu filter hanya untuk GRSM 8, "
-    "jadi aplikasi ini akan memproses SEMUA baris yang memiliki koordinat "
-    "di sheet Exclusive M1 dan Exclusive M3. Baris tanpa Lat/Long akan dilewati."
-)
-
-st.info(
-    "Kolom KATEGORI LOKASI dan NAMA LOKASI akan diisi jika koordinat "
-    "teridentifikasi sebagai POI/tempat bernama di data OpenStreetMap. "
-    "Jika tidak ada POI yang terdaftar, kolom tersebut dibiarkan kosong "
-    "dan ALAMAT tetap diisi semaksimal mungkin."
-)
-
-# ------------------------------------------------------------------
-# Reverse geocoding
-# ------------------------------------------------------------------
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def geocode_photon(lat, lon):
     """Primary reverse geocoder using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
-    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/4.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
+    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/5.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
 
     for attempt in range(4):
         try:
@@ -197,7 +184,7 @@ def geocode_photon(lat, lon):
             alamat = ", ".join(parts)
 
             return {
-                "area": str(area),
+                "area": clean_area_label(area),
                 "alamat": alamat,
                 "kecamatan": str(kec),
                 "kategori_lokasi": kategori_lokasi,
@@ -225,7 +212,7 @@ def geocode_nominatim_fallback(lat, lon):
     """Fallback only for incomplete Photon results. One request at a time."""
     url = "https://nominatim.openstreetmap.org/reverse"
     headers = {
-        "User-Agent": "GRSM8-Coordinate-Geocoder/4.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
+        "User-Agent": "GRSM8-Coordinate-Geocoder/5.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
         "Accept-Language": "id,en",
     }
     response = requests.get(
@@ -276,7 +263,7 @@ def geocode_nominatim_fallback(lat, lon):
 
     alamat = ", ".join(parts)
     return {
-        "area": str(area),
+        "area": clean_area_label(area),
         "alamat": alamat,
         "kecamatan": str(kec),
         "kategori_lokasi": category,
