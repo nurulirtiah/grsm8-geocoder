@@ -1,96 +1,147 @@
 import io
-import json
 import time
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Alamat",
+    page_title="GRSM 8 — Koordinat → Area & Alamat",
     page_icon="📍",
     layout="wide",
 )
 
 st.title("📍 GRSM 8 — Koordinat → Area & Alamat")
-st.caption("Upload Excel → proses koordinat GRSM 8 → download Excel hasil.")
+st.caption("Upload Excel → proses Lat/Long → isi Area & ALAMAT → download Excel.")
 
-TARGET_GRSM = "MU - GRSM 8"
-SHEETS_DEFAULT = ["Exclusive M3", "Exclusive M1"]
+st.info(
+    "File yang kamu upload sudah kamu filter hanya untuk GRSM 8, "
+    "jadi aplikasi ini akan memproses SEMUA baris yang memiliki koordinat "
+    "di sheet Exclusive M1 dan Exclusive M3. Baris tanpa Lat/Long akan dilewati."
+)
 
-@st.cache_data(show_spinner=False)
+# ------------------------------------------------------------------
+# Reverse geocoding
+# ------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def geocode_photon(lat, lon):
+    """Reverse geocode one coordinate using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
-    params = {"lat": float(lat), "lon": float(lon)}
-    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/1.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    headers = {
+        "User-Agent": "GRSM8-Coordinate-Geocoder/2.0"
+    }
 
-    features = data.get("features", [])
-    if not features:
-        return {"area": "", "alamat": "", "status": "Tidak ditemukan"}
+    for attempt in range(4):
+        try:
+            response = requests.get(
+                url,
+                params={"lat": float(lat), "lon": float(lon)},
+                headers=headers,
+                timeout=25,
+            )
 
-    p = features[0].get("properties", {})
-    street = p.get("street") or p.get("name") or ""
-    housenumber = p.get("housenumber") or ""
+            if response.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
 
-    if street and housenumber:
-        alamat = f"{street} No. {housenumber}"
-    else:
-        alamat = street
+            response.raise_for_status()
+            data = response.json()
 
-    # Prefer city/regency-level field, then district/state district.
-    area = (
-        p.get("city")
-        or p.get("county")
-        or p.get("district")
-        or p.get("state_district")
-        or ""
-    )
+            features = data.get("features", [])
+            if not features:
+                return {
+                    "area": "",
+                    "alamat": "",
+                    "status": "TIDAK DITEMUKAN",
+                }
+
+            props = features[0].get("properties", {})
+
+            street = (
+                props.get("street")
+                or props.get("name")
+                or ""
+            )
+            housenumber = props.get("housenumber") or ""
+
+            if street and housenumber:
+                alamat = f"{street} No. {housenumber}"
+            else:
+                alamat = street
+
+            # Photon can return city/county/district depending on location.
+            # For this workbook we want kabupaten/kota.
+            area = (
+                props.get("city")
+                or props.get("county")
+                or props.get("district")
+                or props.get("state_district")
+                or ""
+            )
+
+            return {
+                "area": str(area),
+                "alamat": str(alamat),
+                "status": "OK" if (area or alamat) else "TIDAK LENGKAP",
+            }
+
+        except Exception as exc:
+            if attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                return {
+                    "area": "",
+                    "alamat": "",
+                    "status": f"ERROR: {type(exc).__name__}",
+                }
 
     return {
-        "area": area,
-        "alamat": alamat,
-        "status": "OK" if (area or alamat) else "Tidak lengkap",
+        "area": "",
+        "alamat": "",
+        "status": "ERROR: rate limit",
     }
 
 
 def geocode_google(lat, lon, api_key):
+    """Reverse geocode one coordinate using Google Maps Geocoding API."""
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {
-        "latlng": f"{float(lat)},{float(lon)}",
-        "key": api_key,
-        "language": "id",
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+
+    response = requests.get(
+        url,
+        params={
+            "latlng": f"{float(lat)},{float(lon)}",
+            "key": api_key,
+            "language": "id",
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    data = response.json()
 
     if data.get("status") != "OK" or not data.get("results"):
         return {
             "area": "",
             "alamat": "",
-            "status": data.get("status", "Tidak ditemukan"),
+            "status": data.get("status", "TIDAK DITEMUKAN"),
         }
 
     result = data["results"][0]
     alamat = result.get("formatted_address", "")
     area = ""
 
-    for comp in result.get("address_components", []):
-        types = comp.get("types", [])
+    for component in result.get("address_components", []):
+        types = component.get("types", [])
         if "administrative_area_level_2" in types:
-            area = comp.get("long_name", "")
+            area = component.get("long_name", "")
             break
 
     if not area:
-        for comp in result.get("address_components", []):
-            types = comp.get("types", [])
+        for component in result.get("address_components", []):
+            types = component.get("types", [])
             if "locality" in types:
-                area = comp.get("long_name", "")
+                area = component.get("long_name", "")
                 break
 
     return {
@@ -100,141 +151,197 @@ def geocode_google(lat, lon, api_key):
     }
 
 
-def normalize_coord(v):
+def clean_coord(value):
     try:
-        return round(float(v), 6)
-    except Exception:
+        if value is None or str(value).strip() == "":
+            return None
+        return round(float(value), 7)
+    except (ValueError, TypeError):
         return None
 
 
+def get_columns(ws):
+    headers = []
+    for cell in ws[1]:
+        headers.append(
+            str(cell.value).strip().upper()
+            if cell.value is not None
+            else ""
+        )
+    return {header: idx + 1 for idx, header in enumerate(headers)}
+
+
 def process_workbook(uploaded_file, provider, google_key=None):
-    raw = uploaded_file.getvalue()
-    wb = load_workbook(io.BytesIO(raw))
-    cache = {}
-    results_log = []
+    workbook = load_workbook(
+        io.BytesIO(uploaded_file.getvalue()),
+        data_only=False,
+    )
 
-    # Cache by rounded coordinate so identical/near-identical points
-    # do not generate duplicate API requests.
-    def lookup(lat, lon):
-        key = f"{lat:.6f},{lon:.6f}"
-        if key in cache:
-            return cache[key]
+    # Process these sheets when present. If one is absent, simply skip it.
+    sheet_names = [
+        name for name in ["Exclusive M1", "Exclusive M3"]
+        if name in workbook.sheetnames
+    ]
 
-        if provider == "Google Maps":
-            result = geocode_google(lat, lon, google_key)
-        else:
-            result = geocode_photon(lat, lon)
+    if not sheet_names:
+        # Fallback: process every sheet if the workbook has different names.
+        sheet_names = workbook.sheetnames
 
-        cache[key] = result
-        time.sleep(0.35 if provider == "Google Maps" else 0.7)
-        return result
+    # First pass: collect rows and unique coordinates.
+    jobs = []
+    coordinate_set = set()
+    skipped_no_coord = 0
+    already_complete = 0
 
-    sheets = [s for s in wb.sheetnames if s in SHEETS_DEFAULT]
-    if not sheets:
-        sheets = wb.sheetnames
+    for sheet_name in sheet_names:
+        ws = workbook[sheet_name]
+        cols = get_columns(ws)
 
-    total_candidates = 0
-    for sheet_name in sheets:
-        ws = wb[sheet_name]
-        headers = [str(c.value).strip().upper() if c.value is not None else "" for c in ws[1]]
-        col = {h: i + 1 for i, h in enumerate(headers)}
-
-        required = ["GRSM", "AREA", "LAT", "LONG", "ALAMAT"]
-        missing = [x for x in required if x not in col]
+        missing = [
+            c for c in ["AREA", "LAT", "LONG", "ALAMAT"]
+            if c not in cols
+        ]
         if missing:
-            results_log.append(f"{sheet_name}: dilewati, kolom hilang {missing}")
             continue
 
-        for row in range(2, ws.max_row + 1):
-            grsm = ws.cell(row, col["GRSM"]).value
-            if str(grsm).strip().upper() != TARGET_GRSM.upper():
-                continue
-
-            lat = normalize_coord(ws.cell(row, col["LAT"]).value)
-            lon = normalize_coord(ws.cell(row, col["LONG"]).value)
-
-            if lat is not None and lon is not None:
-                # We process rows where either target field is empty.
-                area_old = ws.cell(row, col["AREA"]).value
-                addr_old = ws.cell(row, col["ALAMAT"]).value
-                if area_old in (None, "") or addr_old in (None, ""):
-                    total_candidates += 1
-
-    progress = st.progress(0, text="Menyiapkan...")
-    done = 0
-    errors = 0
-    skipped = 0
-
-    for sheet_name in sheets:
-        ws = wb[sheet_name]
-        headers = [str(c.value).strip().upper() if c.value is not None else "" for c in ws[1]]
-        col = {h: i + 1 for i, h in enumerate(headers)}
-
-        required = ["GRSM", "AREA", "LAT", "LONG", "ALAMAT"]
-        if any(x not in col for x in required):
-            continue
-
-        for row in range(2, ws.max_row + 1):
-            grsm = ws.cell(row, col["GRSM"]).value
-            if str(grsm).strip().upper() != TARGET_GRSM.upper():
-                continue
-
-            lat = normalize_coord(ws.cell(row, col["LAT"]).value)
-            lon = normalize_coord(ws.cell(row, col["LONG"]).value)
+        for row_num in range(2, ws.max_row + 1):
+            lat = clean_coord(ws.cell(row_num, cols["LAT"]).value)
+            lon = clean_coord(ws.cell(row_num, cols["LONG"]).value)
 
             if lat is None or lon is None:
-                skipped += 1
+                skipped_no_coord += 1
                 continue
 
-            area_old = ws.cell(row, col["AREA"]).value
-            addr_old = ws.cell(row, col["ALAMAT"]).value
+            old_area = ws.cell(row_num, cols["AREA"]).value
+            old_address = ws.cell(row_num, cols["ALAMAT"]).value
 
-            if area_old not in (None, "") and addr_old not in (None, ""):
-                skipped += 1
+            # If both fields are already filled, don't overwrite them.
+            if (
+                old_area not in (None, "")
+                and old_address not in (None, "")
+            ):
+                already_complete += 1
                 continue
+
+            key = (lat, lon)
+            coordinate_set.add(key)
+            jobs.append((sheet_name, row_num, key))
+
+    total_rows = len(jobs)
+    unique_coordinates = len(coordinate_set)
+
+    if total_rows == 0:
+        return (
+            None,
+            {
+                "total_rows": 0,
+                "unique_coordinates": 0,
+                "processed": 0,
+                "errors": 0,
+                "skipped_no_coord": skipped_no_coord,
+                "already_complete": already_complete,
+                "message": (
+                    "Tidak ada baris yang perlu diproses. "
+                    "Pastikan kolom Lat dan Long terisi."
+                ),
+            },
+        )
+
+    # Reverse geocode unique coordinates once.
+    coordinates = list(coordinate_set)
+    results = {}
+    errors = 0
+
+    progress = st.progress(0, text="Menyiapkan koordinat...")
+    status = st.empty()
+
+    # Four workers keeps the process substantially faster than one request
+    # at a time while avoiding an aggressive request flood.
+    max_workers = 4
+
+    def lookup(coord):
+        lat, lon = coord
+        if provider == "Google Maps":
+            return coord, geocode_google(lat, lon, google_key)
+        return coord, geocode_photon(lat, lon)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(lookup, coord): coord
+            for coord in coordinates
+        }
+
+        for index, future in enumerate(as_completed(future_map), start=1):
+            coord = future_map[future]
 
             try:
-                result = lookup(lat, lon)
+                _, result = future.result()
+            except Exception as exc:
+                result = {
+                    "area": "",
+                    "alamat": "",
+                    "status": f"ERROR: {type(exc).__name__}",
+                }
 
-                if result["area"]:
-                    ws.cell(row, col["AREA"]).value = result["area"]
+            results[coord] = result
 
-                if result["alamat"]:
-                    ws.cell(row, col["ALAMAT"]).value = result["alamat"]
-
-                if result["status"] != "OK":
-                    errors += 1
-
-            except Exception as e:
+            if str(result.get("status", "")).startswith("ERROR"):
                 errors += 1
-                results_log.append(
-                    f"{sheet_name} row {row}: {type(e).__name__}: {e}"
-                )
 
-            done += 1
-            pct = min(done / max(total_candidates, 1), 1)
+            pct = index / max(unique_coordinates, 1)
             progress.progress(
                 pct,
-                text=f"Memproses {done:,} / {total_candidates:,} — {sheet_name}",
+                text=f"Reverse geocoding {index:,} / {unique_coordinates:,}"
+            )
+            status.write(
+                f"Koordinat selesai: **{index:,} / {unique_coordinates:,}**"
             )
 
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
+    # Second pass: write results into workbook.
+    rows_written = 0
+
+    for sheet_name, row_num, coord in jobs:
+        ws = workbook[sheet_name]
+        cols = get_columns(ws)
+
+        result = results.get(coord, {})
+        area = result.get("area", "")
+        address = result.get("alamat", "")
+
+        if area:
+            ws.cell(row_num, cols["AREA"]).value = area
+
+        if address:
+            ws.cell(row_num, cols["ALAMAT"]).value = address
+
+        rows_written += 1
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
 
     progress.progress(1.0, text="Selesai.")
-    return out.getvalue(), len(cache), done, skipped, errors, results_log
+    status.empty()
+
+    return output.getvalue(), {
+        "total_rows": total_rows,
+        "unique_coordinates": unique_coordinates,
+        "processed": rows_written,
+        "errors": errors,
+        "skipped_no_coord": skipped_no_coord,
+        "already_complete": already_complete,
+        "message": "",
+    }
 
 
-st.info(
-    "Aplikasi ini hanya memproses baris dengan GRSM = "
-    f"`{TARGET_GRSM}` pada sheet Exclusive M1 dan Exclusive M3."
-)
+# ------------------------------------------------------------------
+# UI
+# ------------------------------------------------------------------
 
 uploaded = st.file_uploader(
     "Upload file Excel",
     type=["xlsx"],
-    help="Gunakan file EXCLUSIVE TOKO M1 M3.xlsx",
+    help="Upload file yang sudah kamu filter hanya GRSM 8.",
 )
 
 provider = st.radio(
@@ -244,42 +351,72 @@ provider = st.radio(
 )
 
 google_key = None
+
 if provider == "Google Maps":
     google_key = st.text_input(
         "Google Maps Geocoding API Key",
         type="password",
-        help="API key digunakan hanya selama proses. Untuk Google Maps Geocoding API, billing/API access perlu aktif pada project Google Cloud.",
     )
-    if not google_key:
-        st.warning("Masukkan API key Google Maps sebelum menjalankan proses.")
 
 if uploaded:
-    if st.button("🚀 Proses GRSM 8", type="primary", disabled=(provider == "Google Maps" and not google_key)):
-        with st.spinner("Membaca workbook dan memproses koordinat..."):
-            output, unique_coords, done, skipped, errors, logs = process_workbook(
-                uploaded, provider, google_key
-            )
+    st.success(
+        f"File siap diproses: **{uploaded.name}** "
+        f"({uploaded.size / 1024:.1f} KB)"
+    )
 
-        st.success("Selesai diproses.")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Koordinat unik diproses", f"{unique_coords:,}")
-        c2.metric("Baris diproses", f"{done:,}")
-        c3.metric("Baris error/tidak lengkap", f"{errors:,}")
+    if st.button(
+        "🚀 Proses Koordinat",
+        type="primary",
+        disabled=(provider == "Google Maps" and not google_key),
+    ):
+        try:
+            with st.spinner("Membaca Excel..."):
+                output, stats = process_workbook(
+                    uploaded,
+                    provider,
+                    google_key,
+                )
 
-        st.download_button(
-            "📥 Download Excel hasil",
-            data=output,
-            file_name="EXCLUSIVE TOKO M1 M3_GRSM8_terisi.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            if output is None:
+                st.warning(stats["message"])
+            else:
+                st.success("🎉 Proses selesai!")
 
-        if logs:
-            with st.expander("Log / catatan"):
-                for item in logs[:100]:
-                    st.write(item)
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric(
+                    "Baris diproses",
+                    f"{stats['processed']:,}",
+                )
+                col2.metric(
+                    "Koordinat unik",
+                    f"{stats['unique_coordinates']:,}",
+                )
+                col3.metric(
+                    "Tanpa koordinat",
+                    f"{stats['skipped_no_coord']:,}",
+                )
+                col4.metric(
+                    "Error",
+                    f"{stats['errors']:,}",
+                )
+
+                st.download_button(
+                    "📥 Download Excel hasil",
+                    data=output,
+                    file_name="EXCLUSIVE TOKO M1 M3_GRSM8_terisi.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    type="primary",
+                )
+
+        except Exception as exc:
+            st.error("Aplikasi mengalami error saat memproses file.")
+            st.exception(exc)
 
 st.markdown("---")
 st.caption(
-    "Catatan: hasil OpenStreetMap/Photon dapat berbeda dari label Google Maps. "
-    "Untuk hasil yang mengikuti Google Maps, pilih Google Maps dan gunakan Geocoding API."
+    "OpenStreetMap / Photon digunakan sebagai default tanpa API key. "
+    "Hasil reverse geocoding dapat berbeda dari label Google Maps."
 )
