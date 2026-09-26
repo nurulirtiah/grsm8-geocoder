@@ -1,5 +1,6 @@
 import io
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -7,12 +8,12 @@ import streamlit as st
 from openpyxl import load_workbook
 
 st.set_page_config(
-    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi",
+    page_title="GRSM 8 — Koordinat → Area, Alamat & Lokasi (v6)",
     page_icon="📍",
     layout="wide",
 )
 
-st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi")
+st.title("📍 GRSM 8 — Koordinat → Area, Alamat & Lokasi (v6)")
 st.caption("Upload Excel → proses Lat/Long → isi Area, ALAMAT, Kategori Lokasi & Nama Lokasi → download Excel.")
 
 
@@ -141,7 +142,7 @@ def extract_poi_from_photon(props):
 def geocode_photon(lat, lon):
     """Primary reverse geocoder using Photon/OpenStreetMap."""
     url = "https://photon.komoot.io/reverse"
-    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/5.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
+    headers = {"User-Agent": "GRSM8-Coordinate-Geocoder/6.0 (+https://github.com/nurulirtiah/grsm8-geocoder)"}
 
     for attempt in range(4):
         try:
@@ -212,7 +213,7 @@ def geocode_nominatim_fallback(lat, lon):
     """Fallback only for incomplete Photon results. One request at a time."""
     url = "https://nominatim.openstreetmap.org/reverse"
     headers = {
-        "User-Agent": "GRSM8-Coordinate-Geocoder/5.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
+        "User-Agent": "GRSM8-Coordinate-Geocoder/6.0 (+https://github.com/nurulirtiah/grsm8-geocoder)",
         "Accept-Language": "id,en",
     }
     response = requests.get(
